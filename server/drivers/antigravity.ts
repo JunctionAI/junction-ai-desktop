@@ -62,6 +62,303 @@ function decodeConfig(raw: unknown): AntigravityConfig {
   }
   return {
     cli: typeof o.cli === "string" ? o.cli : "agy",
+    // Default fullAuto to TRUE: agy's headless print harness invokes tools even
+    // for trivial prompts and, with no interactive approval channel, auto-denies
+    // them — producing no output, so a non-fullAuto bot's turns frequently fail.
+    // Default to fullAuto for a usable bot; per-action consent returns with the
+    // ACP v2 path. Still throws above on a non-boolean fullAuto.
     fullAuto: o.fullAuto === undefined ? true : o.fullAuto === true,
   };
 }
+
+export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
+  driverKind: DRIVER_KIND,
+  metadata: { displayName: "Antigravity", supportsMultipleInstances: true },
+  install: {
+    command: {
+      darwin: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
+      linux: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
+      win32: "irm https://antigravity.google/cli/install.ps1 | iex",
+    },
+    docsUrl: "https://github.com/google-antigravity/antigravity-cli#installation",
+  },
+  models: MODELS,
+  decodeConfig,
+  defaultConfig: () => decodeConfig({}),
+
+  async create(input: DriverCreateInput<AntigravityConfig>): Promise<ProviderInstance> {
+    const { instanceId, config } = input;
+    const listeners = new Set<RuntimeEventListener>();
+    // one active turn per thread; a second send while busy is a caller bug
+    const active = new Map<string, { stop: () => void; turnId: string }>();
+    // every live agy child, tracked independently of `active`: a child can
+    // hang AFTER emitting `result` (so it's already removed from `active`), and
+    // dispose()/stopAll() must still be able to reap it. Removed on process exit.
+    const children = new Set<ChildProcess>();
+
+    const emit = (event: RuntimeEvent) => {
+      for (const l of [...listeners]) l(event);
+    };
+
+    // Reap every tracked child's tree (mirrors the per-turn stop()) — POSIX
+    // process group on mac/linux, taskkill /T on Windows. When escalate is
+    // set a SIGKILL follows after a grace for anything that ignored the term;
+    // on Windows killCliTree is already a force kill, so the retry is a no-op.
+    const reapChildren = (escalate: boolean) => {
+      for (const child of children) {
+        killCliTree(child);
+        if (escalate && process.platform !== "win32") {
+          setTimeout(() => {
+            try {
+              process.kill(-child.pid!, "SIGKILL");
+            } catch {}
+          }, 2000).unref?.();
+        }
+      }
+    };
+    const base = (threadId: string, turnId: string) => ({
+      eventId: newEventId(),
+      provider: DRIVER_KIND,
+      threadId,
+      turnId,
+      createdAt: new Date().toISOString(),
+    });
+
+    const sendTurn = async (turn: SendTurnInput) => {
+      const { threadId } = turn;
+      if (active.has(threadId)) throw new Error("a turn is already running on this thread");
+      const turnId = newId();
+
+      // Default cwd to a per-thread workspace under DATA_DIR — deliberately
+      // NOT homedir(): a bot running unattended should not get the whole home
+      // as its default sandbox. `--add-dir` grants agy access to that dir.
+      // strip filesystem-unsafe chars only — never truncate: a 36-char UUID
+      // sliced to 32 would collide two threads sharing the first 32 chars onto
+      // one workspace dir. replace() already keeps a UUID unique and safe.
+      const tag = threadId.replace(/[^\w-]/g, "");
+      const workspace = join(DATA_DIR, "workspaces", tag);
+      mkdirSync(workspace, { recursive: true });
+      const cwd = turn.cwd ?? workspace;
+
+      // prompt is passed as the `--print` argv value: agy does NOT read the
+      // prompt from piped stdin in print mode — a bare `--print` produces zero
+      // output (verified against agy 1.1.12). Combine persona + text.
+      // Trade-off: a very large prompt could exceed argv limits (E2BIG),
+      // guarded below since stdin is not an option.
+      const prompt = turn.system ? `${turn.system}\n\n${turn.text}` : turn.text;
+      const resumeCursor = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
+
+      let settled = false;
+      // backstop watchdog: if agy hangs without emitting `result` and without
+      // exiting, the bot would stay busy forever (agy's own --print-timeout 10m
+      // is the only other net). Assigned just below; settle() always clears it.
+      let watchdog: ReturnType<typeof setTimeout> | undefined;
+      const settle = (ok: boolean, stopReason: string | null, cost: number | null = null) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(watchdog);
+        active.delete(threadId);
+        emit({ ...base(threadId, turnId), type: "turn.completed", ok, stopReason, cost });
+      };
+
+      // agy's print mode is argv-only, so a prompt beyond ARG_MAX would fail the
+      // spawn with E2BIG. Reject oversized prompts up front with a clear error
+      // instead of a cryptic spawn failure.
+      if (Buffer.byteLength(prompt) > 256 * 1024) {
+        emit({
+          ...base(threadId, turnId),
+          type: "runtime.error",
+          message: `prompt too large for Antigravity's argv-only print mode (${Buffer.byteLength(prompt)} bytes)`,
+        });
+        settle(false, "prompt_too_large");
+        return { turnId };
+      }
+
+      const args = [
+        "--print", prompt,
+        "--output-format", "stream-json",
+        "--print-timeout", "10m",
+        "--add-dir", cwd,
+        config.fullAuto ? "--dangerously-skip-permissions" : "--mode",
+      ];
+      if (!config.fullAuto) args.push("accept-edits");
+      if (turn.model) args.push("--model", turn.model);
+      if (resumeCursor) args.push("--conversation", resumeCursor);
+
+      const env: Record<string, string | undefined> = { ...process.env, PATH: augmentedPath() };
+
+      const child = spawnCli(config.cli, args, {
+        cwd,
+        env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      children.add(child);
+
+      let conversationId: string | null = null;
+
+      const handleLine = (line: string) => {
+        let o: any;
+        try {
+          o = JSON.parse(line);
+        } catch {
+          return;
+        }
+        appendNative(threadId, { dir: "in", source: "agy.stream", msg: o });
+        const payload = o[o.event] ?? {};
+        switch (o.event) {
+          case "init": {
+            conversationId = o.conversation_id ?? null;
+            emit({
+              ...base(threadId, turnId),
+              type: "session.started",
+              sessionId: conversationId,
+              model: turn.model ?? null,
+            });
+            break;
+          }
+          case "step_update": {
+            if (payload.step_type === "tool") {
+              const itemId = `${conversationId ?? o.conversation_id ?? "conv"}:${payload.step_index}`;
+              if (payload.state === "ACTIVE") {
+                emit({ ...base(threadId, turnId), type: "item.started", itemType: "tool", itemId, title: payload.tool_name });
+              } else if (payload.state === "DONE") {
+                emit({ ...base(threadId, turnId), type: "item.completed", itemType: "tool", itemId, ok: true });
+              } else if (payload.state === "ERROR") {
+                emit({ ...base(threadId, turnId), type: "item.completed", itemType: "tool", itemId, ok: false });
+              }
+            } else if (payload.step_type === "agent_response" && payload.usage) {
+              emit({
+                ...base(threadId, turnId),
+                type: "thread.token-usage.updated",
+                input: (payload.usage.input_tokens || 0) + (payload.usage.cache_read_tokens || 0),
+                output: payload.usage.output_tokens || 0,
+              });
+            }
+            break;
+          }
+          case "result": {
+            const response = typeof payload.response === "string" ? payload.response : "";
+            if (response) {
+              emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta: response });
+              emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text: response });
+            }
+            if (payload.usage) {
+              emit({
+                ...base(threadId, turnId),
+                type: "thread.token-usage.updated",
+                input: (payload.usage.input_tokens || 0) + (payload.usage.cache_read_tokens || 0),
+                output: payload.usage.output_tokens || 0,
+              });
+            }
+            settle(payload.status === "SUCCESS", payload.status ?? null, null);
+            break;
+          }
+        }
+      };
+
+      let buf = "";
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => {
+        buf += chunk;
+        let nl;
+        while ((nl = buf.indexOf("\n")) !== -1) {
+          const line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          if (line.trim()) handleLine(line);
+        }
+      });
+
+      let stderr = "";
+      child.stderr.on("data", (c) => {
+        stderr += c;
+        if (stderr.length > 8192) stderr = stderr.slice(-8192);
+      });
+
+      child.on("error", (e) => {
+        emit({ ...base(threadId, turnId), type: "runtime.error", ...describeSpawnFailure(e, config.cli) });
+        settle(false, "spawn_error");
+      });
+
+      child.on("close", (code) => {
+        children.delete(child);
+        if (!settled) {
+          emit({
+            ...base(threadId, turnId),
+            type: "runtime.error",
+            message: `agy exited ${code} before result${stderr ? `: ${stderr.trim().slice(-300)}` : ""}`,
+          });
+          settle(false, "exit_before_result");
+        }
+      });
+
+      const stop = () => killCliTree(child);
+      active.set(threadId, { stop, turnId });
+
+      watchdog = setTimeout(() => {
+        if (!settled) {
+          emit({ ...base(threadId, turnId), type: "runtime.error", message: "agy watchdog timeout" });
+          stop();
+          settle(false, "timeout");
+        }
+      }, 11 * 60_000);
+      watchdog.unref?.();
+
+      emit({ ...base(threadId, turnId), type: "turn.started" });
+
+      return { turnId };
+    };
+
+    const snapshot = async (): Promise<ProviderSnapshot> => {
+      const version = await new Promise<string | null>((resolve) => {
+        execCli(config.cli, ["--version"], { timeout: 8000, env: { ...process.env, PATH: augmentedPath() } }, (err, stdout) =>
+          resolve(err ? null : stdout.trim()),
+        );
+      });
+      if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+      return { state: "available", version };
+    };
+
+    return {
+      instanceId,
+      driverKind: DRIVER_KIND,
+      displayName: input.displayName,
+      enabled: input.enabled,
+      models: MODELS,
+      snapshot,
+      adapter: {
+        provider: DRIVER_KIND,
+        capabilities: { sessionModelSwitch: "in-session" },
+        sendTurn,
+        interruptTurn: async (threadId) => active.get(threadId)?.stop(),
+        respondToRequest: async () => {
+          throw new Error(
+            "Antigravity has no interactive permission channel (run in fullAuto to auto-approve, or await the ACP v2)",
+          );
+        },
+        hasSession: (threadId) => active.has(threadId),
+        stopAll: async () => {
+          for (const { stop } of active.values()) stop();
+          reapChildren(false);
+        },
+        onEvent: (listener) => {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        },
+      },
+      generateText: (prompt: string) =>
+        new Promise((resolve, reject) => {
+          execCli(
+            config.cli,
+            ["-p", prompt, "--output-format", "text", "--model", "gemini-3.6-flash-low"],
+            { timeout: 60_000, env: { ...process.env, PATH: augmentedPath() } },
+            (err, stdout) => (err ? reject(err) : resolve(stdout.trim())),
+          );
+        }),
+      dispose: async () => {
+        for (const { stop } of active.values()) stop();
+        reapChildren(true);
+        listeners.clear();
+      },
+    };
+  },
+};
