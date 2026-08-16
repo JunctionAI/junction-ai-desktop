@@ -53,20 +53,15 @@ await registry.load(instanceConfigs(cfg));
 const bus = new EventBus();
 bus.attach(registry.instances());
 
-// ── peer-agent comms wiring ────────────────────────────────────────
+// ── peer-agent comms wiring ────────────────────────────
 // A shared secret guards the localhost-only /api/internal endpoints the
 // agents-proxy calls; regenerated each boot (the proxy gets it via env).
 const COMMS_TOKEN = randomBytes(24).toString("hex");
-// Cap message chains: depth 0 = a user-initiated turn (may ask a peer);
-// a peer invoked via ask_bot runs at depth 1 and gets NO agents tool, so
-// A→B is allowed but B→C (and A→B→A loops) never start.
 const MAX_COMMS_DEPTH = 1;
-// proxy entry: .ts in dev (node type-strips), .js in the packaged dist-server
 const agentsProxyPath = (() => {
   const ts = join(dirname(fileURLToPath(import.meta.url)), "drivers", "agents-proxy.ts");
   return existsSync(ts) ? ts : ts.replace(/\.ts$/, ".js");
 })();
-// in the packaged app process.execPath is Electron — run the proxy as node
 const AGENTS_NODE_FLAG = { ELECTRON_RUN_AS_NODE: "1" };
 
 function agentsIntegration(botId: string, depth: number) {
@@ -83,9 +78,6 @@ function agentsIntegration(botId: string, depth: number) {
   };
 }
 
-/** Run a turn on `targetBotId` and resolve with its assistant text — the
- * synchronous half of ask_bot. Subscribes to the bus, folds assistant_text
- * for that thread, resolves on turn.completed (or a 4-min ceiling). */
 function askBotAndWait(targetBotId: string, message: string, depth: number): Promise<string> {
   const target = store.bot(targetBotId);
   if (!target) return Promise.resolve("(no such bot)");
@@ -114,3 +106,182 @@ function askBotAndWait(targetBotId: string, message: string, depth: number): Pro
     );
   });
 }
+
+async function defaultSelection() {
+  const described = await registry.describe();
+  const available = described.filter((d) => d.snapshot.state === "available");
+  const pick = available.find((d) => d.driverKind === "claudeAgent") ?? available[0];
+  return { instanceId: pick?.instanceId ?? "", model: pick?.models.default ?? "" };
+}
+let bootSelection = { instanceId: "", model: "" };
+const store = new Store(() => bootSelection);
+bootSelection = await defaultSelection();
+store.seedIfEmpty();
+
+const publicBot = (bot: NonNullable<ReturnType<typeof store.bot>>) => ({
+  ...bot,
+  messages: store.messagesFor(bot.threadId),
+  activeLeafId: store.activeLeaf(bot.threadId),
+  tasks: store.tasks(bot.id).map(({ resumeCursors, ...task }) => task),
+});
+
+const sseClients = new Set<ServerResponse>();
+function broadcast(payload: unknown) {
+  const frame = `data: ${JSON.stringify(payload)}\n\n`;
+  for (const res of [...sseClients]) {
+    try { res.write(frame); } catch { sseClients.delete(res); }
+  }
+}
+
+const toolMessageByItem = new Map<string, string>();
+const askMessageByRequest = new Map<string, string>();
+const groupSpeakers = new Map<string, { botId: string; name: string; color: string }>();
+let routines: RoutineManager | null = null;
+let activeVmThreadId: string | null = null;
+let localVmLifecycleBusy = false;
+
+bus.subscribe((event: RuntimeEvent) => {
+  broadcast({ kind: "runtime", event });
+  routines?.handleRuntimeEvent(event);
+  const bot = store.botByThread(event.threadId);
+  const group = bot ? undefined : store.groupByThread(event.threadId);
+  if (!bot && !group) return;
+  const speaker = group ? groupSpeakers.get(event.threadId) : undefined;
+  const pushMessage = (m: Omit<Message, "id" | "at">) => {
+    const message = store.appendMessage(event.threadId, group && m.role === "bot" ? { ...m, from: speaker } : m);
+    broadcast({ kind: "message", threadId: event.threadId, message });
+    return message;
+  };
+  switch (event.type) {
+    case "session.started":
+      if (bot && event.sessionId && event.providerInstanceId) {
+        store.setResumeCursor(bot.id, event.providerInstanceId, event.sessionId, event.threadId);
+      }
+      break;
+    case "item.completed":
+      if (event.itemType === "assistant_text") {
+        pushMessage({ role: "bot", kind: "text", text: event.text });
+      } else if (event.itemType === "tool" && event.itemId) {
+        const itemKey = `${event.threadId}:${event.itemId}`;
+        const messageId = toolMessageByItem.get(itemKey);
+        let toolName = "tool";
+        if (messageId) {
+          const existing = store.messagesFor(event.threadId).find((m) => m.id === messageId)?.tool;
+          toolName = existing?.name ?? "tool";
+          const patched = store.patchMessage(event.threadId, messageId, {
+            tool: { name: toolName, ok: event.ok, spoken: existing?.spoken },
+          });
+          if (patched) broadcast({ kind: "message.patch", threadId: event.threadId, message: patched });
+          toolMessageByItem.delete(itemKey);
+        }
+        if (bot && /computer|screenshot|click|type_text|press_key|scroll|open_url/i.test(toolName)) {
+          pokeScreenPoller(bot.id);
+        }
+      }
+      break;
+    case "item.started":
+      if (event.itemType === "tool") {
+        if (event.title?.endsWith("__ask_bot")) break;
+        const name = event.title ?? "tool";
+        const message = pushMessage({
+          role: "bot",
+          kind: "activity",
+          tool: { name, spoken: narrateTool(name) ?? undefined },
+        });
+        if (event.itemId) toolMessageByItem.set(`${event.threadId}:${event.itemId}`, message.id);
+      }
+      break;
+    case "request.opened": {
+      const permission = event.requestType === "permission";
+      const asker = bot ?? (speaker ? store.bot(speaker.botId) : undefined);
+      const settled = permission && asker && event.requestId
+        ? autoDecision(asker, event.tool, event.summary)
+        : null;
+      if (settled && asker && event.requestId) {
+        const instance = event.providerInstanceId
+          ? registry.get(event.providerInstanceId)
+          : registry.get(asker.modelSelection.instanceId);
+        const requestId = event.requestId;
+        const { tool, summary } = event;
+        void (async () => {
+          try {
+            if (!instance) throw new Error("provider unavailable");
+            await instance.adapter.respondToRequest(event.threadId, requestId, { behavior: "allow" });
+            pushMessage({
+              role: "bot",
+              kind: "activity",
+              tool: { name: `${settled}: ${summary.slice(0, 120)}`, ok: true },
+            });
+          } catch {
+            const card = pushMessage({
+              role: "bot",
+              kind: "options",
+              card: {
+                title: "Approval needed",
+                subtitle: summary,
+                options: ["Allow", "Deny"],
+                requestId,
+                tool,
+                allowKey: approvalKey(tool, summary),
+                held: "Auto mode couldn't answer this one.",
+              },
+            });
+            askMessageByRequest.set(`${event.threadId}:${requestId}`, card.id);
+          }
+        })();
+        break;
+      }
+      const message = pushMessage({
+        role: "bot",
+        kind: "options",
+        card: {
+          title: permission ? "Approval needed" : "Your bot has a question",
+          subtitle: event.summary,
+          options: event.choices?.length ? event.choices : permission ? ["Allow", "Deny"] : [],
+          requestId: event.requestId,
+          tool: permission ? event.tool : undefined,
+          allowKey: permission ? approvalKey(event.tool, event.summary) : undefined,
+          held: permission && asker?.autoApprove ? "This looked destructive, so auto mode stopped to ask." : undefined,
+        },
+      });
+      if (event.requestId) askMessageByRequest.set(`${event.threadId}:${event.requestId}`, message.id);
+      break;
+    }
+    case "request.resolved": {
+      const messageId = event.requestId ? askMessageByRequest.get(`${event.threadId}:${event.requestId}`) : null;
+      if (messageId) {
+        const existing = store.messagesFor(event.threadId).find((m) => m.id === messageId);
+        if (existing?.card && !existing.card.answered) {
+          const patched = store.patchMessage(event.threadId, messageId, {
+            card: { ...existing.card, answered: event.behavior, dismissed: event.source !== "user" },
+          });
+          if (patched) broadcast({ kind: "message.patch", threadId: event.threadId, message: patched });
+        }
+        if (event.requestId) askMessageByRequest.delete(`${event.threadId}:${event.requestId}`);
+      }
+      break;
+    }
+    case "runtime.error":
+      pushMessage({
+        role: "bot",
+        kind: "activity",
+        tool: { name: `error: ${event.message.slice(0, 160)}`, ok: false, setup: event.setup },
+      });
+      break;
+    case "turn.completed": {
+      if (activeVmThreadId === event.threadId) activeVmThreadId = null;
+      if (bot) {
+        store.patchBot(bot.id, { busy: false, unread: true });
+        broadcast({ kind: "bot", bot: store.bot(bot.id) });
+        if (screenPollers.has(bot.id)) {
+          void finalScreenFrame(bot.id).then((frame) => {
+            if (frame && store.bot(bot.id)) {
+              pushMessage({ role: "bot", kind: "screen", png: frame.png, mime: frame.mime });
+            }
+          });
+        }
+      }
+      break;
+    }
+  }
+});
