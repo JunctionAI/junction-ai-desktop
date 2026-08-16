@@ -53,7 +53,7 @@ await registry.load(instanceConfigs(cfg));
 const bus = new EventBus();
 bus.attach(registry.instances());
 
-// ── peer-agent comms wiring ────────────────────────────────────
+// ── peer-agent comms wiring ────────────────────────────
 // A shared secret guards the localhost-only /api/internal endpoints the
 // agents-proxy calls; regenerated each boot (the proxy gets it via env).
 const COMMS_TOKEN = randomBytes(24).toString("hex");
@@ -81,4 +81,36 @@ function agentsIntegration(botId: string, depth: number) {
       OMB_TURN_DEPTH: String(depth),
     },
   };
+}
+
+/** Run a turn on `targetBotId` and resolve with its assistant text — the
+ * synchronous half of ask_bot. Subscribes to the bus, folds assistant_text
+ * for that thread, resolves on turn.completed (or a 4-min ceiling). */
+function askBotAndWait(targetBotId: string, message: string, depth: number): Promise<string> {
+  const target = store.bot(targetBotId);
+  if (!target) return Promise.resolve("(no such bot)");
+  const threadId = target.threadId;
+  return new Promise((resolve) => {
+    let text = "";
+    let done = false;
+    const finish = (out: string) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      unsub();
+      resolve(out);
+    };
+    const unsub = bus.subscribe((e: RuntimeEvent) => {
+      if (e.threadId !== threadId) return;
+      if (e.type === "item.completed" && e.itemType === "assistant_text") {
+        text += (text ? "\n" : "") + e.text;
+      } else if (e.type === "turn.completed") {
+        finish(text || "(the bot finished without a text reply)");
+      }
+    });
+    const timer = setTimeout(() => finish(text || "(timed out waiting for the bot to reply)"), 4 * 60_000);
+    startTurn(targetBotId, message, { commsDepth: depth + 1 }).catch((err) =>
+      finish(`(couldn't start that bot: ${err instanceof Error ? err.message : String(err)})`),
+    );
+  });
 }
