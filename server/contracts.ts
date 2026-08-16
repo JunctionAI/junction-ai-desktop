@@ -10,7 +10,7 @@ export type InstanceId = string;
 export type ThreadId = string;
 export type TurnId = string;
 
-// ── model selection ────────────────────────────────────────────
+// ── model selection ────────────────────────────────
 // "Which model" is a data value carried on the request, never a service
 // binding (upstream ModelSelectionWire). instanceId is the routing key.
 export interface ModelSelection {
@@ -18,7 +18,7 @@ export interface ModelSelection {
   model: string;
 }
 
-// ── instance configuration envelope ────────────────────────────
+// ── instance configuration envelope ────────────────────
 // `driver` is any slug — NOT validated against known drivers; unknown
 // drivers round-trip and surface as unavailable shadow snapshots so a
 // config from a newer build downgrades safely.
@@ -33,7 +33,7 @@ export interface InstanceConfig {
 
 export type InstanceConfigMap = Record<InstanceId, InstanceConfig>;
 
-// ── canonical runtime events ───────────────────────────────────
+// ── canonical runtime events ───────────────────────
 // Subset of upstream's 49-member ProviderRuntimeEvent union — the ~12 types
 // the recipe says to start with, sharing one base. `raw` carries the
 // native protocol message when a consumer needs to see behind the
@@ -142,7 +142,7 @@ export interface ProviderAdapter {
   onEvent(listener: RuntimeEventListener): () => void;
 }
 
-// ── provider snapshot (upstream ServerProviderShape, reduced) ────
+// ── provider snapshot (upstream ServerProviderShape, reduced) ────────
 export interface ProviderSnapshot {
   state: "available" | "unavailable";
   reason?: string;
@@ -150,7 +150,7 @@ export interface ProviderSnapshot {
   version?: string | null;
 }
 
-// ── engine install descriptor ───────────────────────────────────
+// ── engine install descriptor ──────────────────────────
 // How a user gets this engine onto their machine. Declared by the driver so
 // that adding a provider stays "one file in drivers/ plus a registration":
 // onboarding, the model picker, and settings all render from this instead of
