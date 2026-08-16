@@ -33,6 +33,8 @@ export function TaskPicker({ bot }: { bot: Bot }) {
     };
   }, [open]);
 
+  // a bot that has only ever done one thing doesn't need a switcher yet —
+  // just the button that gives it a second context
   if (tasks.length <= 1) {
     return (
       <button
