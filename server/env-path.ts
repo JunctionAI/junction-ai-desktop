@@ -49,7 +49,7 @@ function knownDirs(): string[] {
  * invisible until it restarts, because Windows never pushes PATH changes
  * into a live process. Scanning the standard install locations recovers
  * those without a restart — `~/.grok/bin` (the x.ai installer) and
- * `%APPDATA%\\npm` (global npm shims), plus `%LOCALAPPDATA%\\agy\\bin`, cover
+ * `%APPDATA%\npm` (global npm shims), plus `%LOCALAPPDATA%\agy\bin`, cover
  * every engine we ship an install command for. */
 function windowsKnownDirs(): string[] {
   const home = homedir();
@@ -126,7 +126,7 @@ export function resetPathCacheForTests(): void {
   probed = false;
 }
 
-// Windows CLI resolution ───────────────────────────────────────
+// Windows CLI resolution ───────────────────────────────
 // PATH alone is not enough on Windows. libuv ignores PATHEXT, so
 // spawn("claude") never finds claude.cmd — and since Node's
 // CVE-2024-27980 fix, spawning a .cmd without shell:true throws
@@ -185,8 +185,8 @@ function nodeExe(near: string): string | null {
   return (process.versions as Record<string, string | undefined>).electron ? null : process.execPath;
 }
 
-/** npm/pnpm .cmd shims all spell their target as "%dp0%\\..." (or
- * "%~dp0\\..."). Whatever of those exists on disk is what the shim runs. */
+/** npm/pnpm .cmd shims all spell their target as "%dp0%\..." (or
+ * "%~dp0\..."). Whatever of those exists on disk is what the shim runs. */
 function parseCmdShim(shim: string): ResolvedSpawn | null {
   let text: string;
   try {
