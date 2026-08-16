@@ -1,0 +1,132 @@
+appId: ai.getjunction.desktop
+productName: Junction AI
+artifactName: JunctionAI-${version}-${arch}.${ext}
+
+# In-app auto-update reads latest-mac.yml + the .zip (macOS) or latest.yml +
+# the NSIS .exe (Windows) from this PUBLIC releases repo (separate from the
+# source repo). Public → no token on users' machines. Baked into
+# app-update.yml; both metadata files are emitted here even with
+# --publish never, and must be uploaded to the GitHub release alongside the
+# artifacts — a release missing latest.yml leaves every Windows install
+# stranded on its installed version.
+# Official OpenMausBot updates would overwrite this branded skin.
+publish: null
+
+directories:
+  buildResources: build
+  output: release
+
+# The app is three self-contained pieces, none needing node_modules at
+# runtime: the Electron main/preload (plain .mjs/.cjs), the built UI
+# (Vite → ui/), and the compiled harness server (tsc → server/), both
+# shipped in Resources and run on Electron's own Node via
+# ELECTRON_RUN_AS_NODE (the agentcal-hq pattern).
+files:
+  - electron/**
+  - "!electron/**/*.test.*"
+  - "!electron/resources/speech-helper"
+  - "!electron/resources/speech-helper.swift"
+  - "!electron/resources/speech-helper-Info.plist"
+  - "!electron/resources/OpenMausBot Speech.app/**"
+  - "!**/node_modules/**"
+  - package.json
+
+asar: true
+
+extraResources:
+  - from: dist
+    to: ui
+  - from: dist-server
+    to: server
+
+mac:
+  target:
+    - target: dmg
+      arch: arm64
+    - target: zip
+      arch: arm64
+  icon: build/icon.icns
+  category: public.app-category.productivity
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  # the dictation helper is a signed background app — Windows and Linux never see it
+  extraResources:
+    - from: electron/resources/OpenMausBot Speech.app
+      to: OpenMausBot Speech.app
+    # CUA must live outside ASAR. prepare-cua stages the signed executable and
+    # a self-contained JS/native SDK bundle selected for macOS arm64.
+    - from: dist-native/cua-driver
+      to: cua-driver
+    - from: dist-native/cua-sdk
+      to: cua-sdk
+  extendInfo:
+    NSMicrophoneUsageDescription: Junction uses the microphone for voice dictation into the composer.
+    NSSpeechRecognitionUsageDescription: Junction transcribes your voice on-device to type messages for you.
+    NSAccessibilityUsageDescription: Junction uses Accessibility when you let a bot control this Mac.
+    NSScreenCaptureUsageDescription: Junction uses Screen Recording so bots can see this Mac before acting.
+  # Notarization runs manually after the build (notarytool + staple),
+  # mirroring the BlueyLite ship_release.sh flow.
+  notarize: false
+
+dmg:
+  sign: true
+  artifactName: JunctionAI-${version}.dmg
+
+win:
+  target:
+    - target: nsis
+      arch: x64
+    - target: zip
+      arch: x64
+  icon: build/icon.ico
+  # No signing config yet (would go under win.signtoolOptions or
+  # win.azureSignOptions — eb 26 nests it, there is no top-level
+  # win.certificateFile). The installer is unsigned, so SmartScreen shows
+  # "unknown publisher" on first run (README says so). verifyUpdateCodeSignature
+  # defaults true, but electron-updater skips the check when app-update.yml
+  # carries no publisherName — so auto-update still works today. Do NOT set
+  # publisherName without actually signing, or every update is rejected as
+  # untrusted; and once signed, keep the cert subject stable (or list both old
+  # and new in publisherName) or you strand already-installed users.
+
+nsis:
+  oneClick: true
+  perMachine: false
+  shortcutName: Junction AI
+  # Versioned, like the .dmg. The README's /latest/download/ button needs a
+  # STABLE filename, so ship a second copy named OpenMausBot-setup.exe on the
+  # release — the same trick as OpenMausBot.dmg beside OpenMausBot-${version}.dmg.
+  artifactName: JunctionAI-${version}-setup.${ext}
+
+linux:
+  target:
+    - target: AppImage
+      arch: x64
+    - target: deb
+      arch: x64
+  # Keep the vector source in the freedesktop scalable icon hierarchy. A
+  # lone 1024px PNG is not indexed by GNOME's hicolor theme on Ubuntu 24.04.
+  icon: build/icon.svg
+  category: Utility
+  executableName: junction-ai
+  synopsis: Your own team of AI bots, in a chat app
+  description: A local-first chat app for running a team of AI agents.
+  maintainer: Milind Soni <46266943+milind-soni@users.noreply.github.com>
+  vendor: Junction AI
+  syncDesktopName: true
+  desktop:
+    entry:
+      Name: Junction AI
+      Comment: Your own team of AI bots, in a chat app
+      Keywords: AI;Agents;Chat;Productivity;
+
+deb:
+  packageCategory: utils
+  priority: optional
+  compression: gz
+
+# Static AppImage runtime: Ubuntu 24.04 can launch it without legacy FUSE 2.
+toolsets:
+  appimage: "1.0.3"
