@@ -1,0 +1,4 @@
+Junction AI icons were cut from /workspace/setups/brand/junction-ai-logomark.png on Linux.
+build/icon.icns is a real PNG-compressed ICNS (icp4/icp5/icp6/ic07-ic10/ic11-ic14).
+It was written with a Python ICNS writer, not iconutil/Xcode. Rebuild on a Mac with iconutil if a notarized DMG needs a platform-native icns.
+build/icon.iconset/ has the PNG sizes.
